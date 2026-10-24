@@ -60,6 +60,38 @@ const LANGUAGE_BY_MANIFEST = [
 const IMPORT_PATTERN = /\b(?:import\s+(?:[^"'`]*?\s+from\s+)?|export\s+[^"'`]*?\s+from\s+|require\s*\(\s*)["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
 const PYTHON_IMPORT_PATTERN = /^\s*(?:from\s+([\w.]+)\s+import\b|import\s+([\w.]+))/gm;
 const GO_IMPORT_PATTERN = /^\s*import\s+(?:\([^)]*\)|"(.*?)"|[\w.]+\s+"(.*?)")/gms;
+const DEFAULT_RULES = [
+  {
+    id: 'RULE-001',
+    from: 'frontend',
+    to: 'database',
+    severity: 'critical',
+    message: 'Frontend must not import database files.'
+  },
+  {
+    id: 'RULE-002',
+    from: 'frontend',
+    to: 'backend',
+    severity: 'critical',
+    message: 'Frontend must not import backend files directly.'
+  },
+  {
+    id: 'RULE-003',
+    from: 'database',
+    to: ['frontend', 'backend'],
+    severity: 'critical',
+    message: 'Database must not import frontend or backend files.'
+  },
+  {
+    id: 'RULE-004',
+    from: 'service',
+    to: 'frontend',
+    severity: 'warning',
+    message: 'Services must not import frontend files.'
+  }
+];
+
+const VALID_LAYERS = new Set(['frontend', 'backend', 'database', 'service', 'services', 'shared']);
 
 function inferLayer(value) {
   for (const [layer, pattern] of LAYER_RULES) {
@@ -238,7 +270,23 @@ function buildModules(files, folders) {
 }
 
 function buildEdges(sourceImports, modules, topLevelFolders, fileSet) {
+  const dependencies = buildDependencies(sourceImports, modules, topLevelFolders, fileSet);
   const edgeCounts = new Map();
+  for (const dependency of dependencies) {
+    if (dependency.from === dependency.to) continue;
+    const key = `${dependency.from}\u0000${dependency.to}`;
+    edgeCounts.set(key, (edgeCounts.get(key) || 0) + 1);
+  }
+  return [...edgeCounts.entries()]
+    .map(([key, count]) => {
+      const [from, to] = key.split('\u0000');
+      return { from, to, count };
+    })
+    .sort((left, right) => right.count - left.count || left.from.localeCompare(right.from));
+}
+
+function buildDependencies(sourceImports, modules, topLevelFolders, fileSet) {
+  const dependencies = [];
   for (const [filePath, imports] of sourceImports) {
     const from = moduleForPath(filePath, topLevelFolders);
     if (!modules.has(from)) continue;
@@ -265,17 +313,150 @@ function buildEdges(sourceImports, modules, topLevelFolders, fileSet) {
       if (!targetPath) continue;
 
       const to = moduleForPath(targetPath, topLevelFolders);
-      if (from === to || !modules.has(to)) continue;
-      const key = `${from}\u0000${to}`;
-      edgeCounts.set(key, (edgeCounts.get(key) || 0) + 1);
+      if (!modules.has(to)) continue;
+      dependencies.push({
+        from,
+        to,
+        fromFile: filePath,
+        toFile: targetPath,
+        fromLayer: normalizeLayer(inferLayer(from === '.' ? 'root' : from)),
+        toLayer: normalizeLayer(inferLayer(to === '.' ? 'root' : to))
+      });
     }
   }
-  return [...edgeCounts.entries()]
-    .map(([key, count]) => {
-      const [from, to] = key.split('\u0000');
-      return { from, to, count };
-    })
-    .sort((left, right) => right.count - left.count || left.from.localeCompare(right.from));
+  return dependencies;
+}
+
+function normalizeLayer(layer) {
+  return layer === 'services' ? 'service' : layer;
+}
+
+function parseYamlRuleConfig(source) {
+  const lines = source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+  if (lines.shift() !== 'rules:') throw new Error('Expected a top-level "rules:" list.');
+  const rules = [];
+  let currentRule = null;
+  for (const line of lines) {
+    if (line.startsWith('- ')) {
+      currentRule = {};
+      rules.push(currentRule);
+      const firstField = line.slice(2);
+      if (firstField) addYamlRuleField(currentRule, firstField);
+      continue;
+    }
+    if (!currentRule) throw new Error('Expected each rule to start with "- id:".');
+    addYamlRuleField(currentRule, line);
+  }
+  return { rules };
+}
+
+function addYamlRuleField(rule, field) {
+  const separator = field.indexOf(':');
+  if (separator < 1) throw new Error(`Invalid rule field "${field}".`);
+  const key = field.slice(0, separator).trim();
+  const rawValue = field.slice(separator + 1).trim();
+  if (!['id', 'from', 'to', 'severity', 'message'].includes(key) || Object.hasOwn(rule, key)) {
+    throw new Error(`Unknown or duplicate rule field "${key}".`);
+  }
+  let value = rawValue;
+  if (rawValue.startsWith('"')) {
+    try {
+      value = JSON.parse(rawValue);
+    } catch {
+      throw new Error(`Invalid quoted value for "${key}".`);
+    }
+  } else if (rawValue.startsWith("'")) {
+    if (!rawValue.endsWith("'") || rawValue.length < 2) {
+      throw new Error(`Invalid quoted value for "${key}".`);
+    }
+    value = rawValue.slice(1, -1).replace(/''/g, "'");
+  } else if (!rawValue || /(^|\s)#/.test(rawValue)) {
+    value = rawValue.split(/\s+#/, 1)[0].trim();
+  }
+  if (typeof value !== 'string' || !value) throw new Error(`Rule field "${key}" must have a value.`);
+  rule[key] = value;
+}
+
+function validateCustomRules(config) {
+  if (!config || typeof config !== 'object' || !Array.isArray(config.rules)) {
+    throw new Error('Expected a "rules" array.');
+  }
+  const ids = new Set();
+  return config.rules.map((rule, index) => {
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+      throw new Error(`Rule ${index + 1} must be an object.`);
+    }
+    const { id, from, to, severity, message } = rule;
+    if (typeof id !== 'string' || !/^RULE-[A-Z0-9-]+$/.test(id)) {
+      throw new Error(`Rule ${index + 1} has an invalid id.`);
+    }
+    if (ids.has(id)) throw new Error(`Rule id "${id}" is duplicated.`);
+    ids.add(id);
+    if (typeof from !== 'string' || !VALID_LAYERS.has(from)
+        || typeof to !== 'string' || !VALID_LAYERS.has(to)) {
+      throw new Error(`Rule "${id}" must use valid from/to layers.`);
+    }
+    if (!['critical', 'warning'].includes(severity)) {
+      throw new Error(`Rule "${id}" must use "critical" or "warning" severity.`);
+    }
+    if (typeof message !== 'string' || !message.trim()) {
+      throw new Error(`Rule "${id}" must have a message.`);
+    }
+    return { id, from: normalizeLayer(from), to: normalizeLayer(to), severity, message };
+  });
+}
+
+async function loadRules(repositoryPath, files) {
+  const configPath = ['driftwatch.yml', 'driftwatch.json'].find((name) => files.includes(name));
+  if (!configPath) return { rules: DEFAULT_RULES, error: null };
+  try {
+    const absolutePath = path.join(repositoryPath, configPath);
+    const info = await fs.stat(absolutePath);
+    if (info.size > MAX_SOURCE_SIZE) throw new Error('Rule configuration exceeds the 128 KiB scan limit.');
+    const source = await fs.readFile(absolutePath, 'utf8');
+    const config = configPath.endsWith('.json') ? JSON.parse(source) : parseYamlRuleConfig(source);
+    const customRules = validateCustomRules(config);
+    const rulesById = new Map(DEFAULT_RULES.map((rule) => [rule.id, rule]));
+    for (const rule of customRules) rulesById.set(rule.id, rule);
+    return { rules: [...rulesById.values()], error: null };
+  } catch (error) {
+    return {
+      rules: DEFAULT_RULES,
+      error: `Could not load ${configPath}: ${error.message} Using the default rules.`
+    };
+  }
+}
+
+function evaluateRules(dependencies, rules) {
+  const violations = [];
+  const violatingDependencies = new Set();
+  for (const dependency of dependencies) {
+    for (const rule of rules) {
+      const targetLayers = Array.isArray(rule.to) ? rule.to : [rule.to];
+      if (dependency.fromLayer !== rule.from || !targetLayers.includes(dependency.toLayer)) continue;
+      violations.push({
+        ruleId: rule.id,
+        severity: rule.severity,
+        message: rule.message,
+        fromFile: dependency.fromFile,
+        toFile: dependency.toFile,
+        fromLayer: dependency.fromLayer,
+        toLayer: dependency.toLayer
+      });
+      violatingDependencies.add(dependency);
+    }
+  }
+  const critical = violations.filter((violation) => violation.severity === 'critical').length;
+  const warnings = violations.filter((violation) => violation.severity === 'warning').length;
+  return {
+    violations,
+    healthScore: Math.max(0, 100 - critical * 10 - warnings * 3),
+    summary: {
+      healthy: dependencies.length - violatingDependencies.size,
+      warnings,
+      critical
+    }
+  };
 }
 
 async function readRecentCommits(repositoryPath, signal) {
@@ -306,6 +487,7 @@ async function readRecentCommits(repositoryPath, signal) {
 async function analyzeRepository(repositoryPath, onProgress = () => {}, signal, maxFiles = MAX_FILES) {
   const { files, folders } = await walkRepository(repositoryPath, onProgress, signal, maxFiles);
   onProgress(files.length, true);
+  const { rules, error: ruleConfigError } = await loadRules(repositoryPath, files);
 
   const languages = new Map();
   const manifests = [];
@@ -363,7 +545,9 @@ async function analyzeRepository(repositoryPath, onProgress = () => {}, signal, 
   }
 
   const { modules, topLevelFolders, ids } = buildModules(files, folders);
+  const dependencies = buildDependencies(sourceImports, ids, topLevelFolders, fileSet);
   const edges = buildEdges(sourceImports, ids, topLevelFolders, fileSet);
+  const ruleResults = evaluateRules(dependencies, rules);
   for (const module of modules) {
     if (packageNames.has(module.id)) module.name = packageNames.get(module.id);
   }
@@ -379,7 +563,9 @@ async function analyzeRepository(repositoryPath, onProgress = () => {}, signal, 
       .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name)),
     manifests,
     modules,
-    edges
+    edges,
+    ...ruleResults,
+    ruleConfigError
   };
 }
 
