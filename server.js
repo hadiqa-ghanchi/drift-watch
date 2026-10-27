@@ -10,6 +10,7 @@ const express = require('express');
 const session = require('express-session');
 const Database = require('better-sqlite3');
 const { analyzeRepository, readRecentCommits } = require('./scanner');
+const { PublicScanError, scanDemoRepository, scanPublicRepository } = require('./public-scanner');
 
 const runFile = promisify(execFile);
 const PORT = Number(process.env.PORT || 3000);
@@ -23,9 +24,11 @@ const PUBLIC_DIR = __dirname;
 const SESSION_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
 const MAX_REPOSITORY_SIZE_KB = 204800;
 const MAX_ACTIVE_SCANS = 2;
+const MAX_ACTIVE_PUBLIC_SCANS = 2;
 const SCAN_JOB_MAX_AGE = 30 * 60 * 1000;
 const scanJobs = new Map();
 let activeScanCount = 0;
+let activePublicScanCount = 0;
 const PUBLIC_ASSETS = new Set([
   'app.js',
   'drift-icon.png',
@@ -828,6 +831,35 @@ app.post('/api/scans', async (req, res) => {
   res.status(202).json({ scanId: id, status: job.status, progress: job.progress, stage: job.stage });
 });
 
+app.post('/api/scan', async (req, res) => {
+  const origin = req.get('origin');
+  if (origin && origin !== appBase.origin) {
+    res.status(403).json({ error: 'This request could not be verified. Refresh the page and try again.' });
+    return;
+  }
+  if (activePublicScanCount >= MAX_ACTIVE_PUBLIC_SCANS) {
+    res.status(429).json({ error: 'The scan server is busy. Please try again shortly.', code: 'scan_capacity' });
+    return;
+  }
+
+  activePublicScanCount += 1;
+  try {
+    const result = req.body && req.body.demo === true
+      ? await scanDemoRepository()
+      : await scanPublicRepository(req.body || {});
+    res.json(result);
+  } catch (error) {
+    if (error instanceof PublicScanError) {
+      res.status(error.status).json({ error: error.message, code: error.code });
+      return;
+    }
+    console.error('Public repository scan failed:', error.message);
+    res.status(500).json({ error: 'The repository scan failed unexpectedly. Please try again.', code: 'scan_failed' });
+  } finally {
+    activePublicScanCount -= 1;
+  }
+});
+
 app.get('/api/scans/latest', (req, res) => {
   res.json(req.session.latestScan || null);
 });
@@ -870,6 +902,18 @@ app.delete('/api/scans/:scanId', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true });
+});
+
+app.use((error, req, res, next) => {
+  if (req.path !== '/api/scan') {
+    next(error);
+    return;
+  }
+  const status = error.status === 413 ? 413 : 400;
+  const message = status === 413
+    ? 'The request body is too large.'
+    : 'The scan request must contain valid JSON.';
+  res.status(status).json({ error: message, code: status === 413 ? 'request_too_large' : 'invalid_json' });
 });
 
 app.listen(PORT, () => {

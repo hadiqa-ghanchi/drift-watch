@@ -70,6 +70,24 @@ test('GitHub OAuth session persists across restarts and rejects invalid requests
   const initialStatus = await fetch(`${baseUrl}/api/github/status`).then((response) => response.json());
   assert.equal(initialStatus.connected, false);
 
+  const demoScanResponse = await fetch(`${baseUrl}/api/scan`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ demo: true })
+  });
+  assert.equal(demoScanResponse.status, 200);
+  const demoScan = await demoScanResponse.json();
+  assert.equal(demoScan.healthScore, 87);
+  assert.deepEqual(demoScan.summary, { healthy: 4, warnings: 1, critical: 1 });
+  assert.deepEqual(demoScan.violations.map(({ ruleId }) => ruleId), ['RULE-001', 'RULE-004']);
+
+  const invalidPublicScanResponse = await fetch(`${baseUrl}/api/scan`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ url: 'https://example.com/owner/repo' })
+  });
+  assert.equal(invalidPublicScanResponse.status, 400);
+
   const connectResponse = await fetch(`${baseUrl}/api/github/connect`);
   assert.equal(connectResponse.status, 200);
   const cookieHeader = connectResponse.headers.get('set-cookie');

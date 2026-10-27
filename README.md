@@ -35,6 +35,8 @@ The OAuth callback uses a per-session, one-time `state` value. Session cookies a
 
 The static analyzer skips `.git`, dependency caches/vendor folders, and common build outputs, rejects repositories whose GitHub-reported size exceeds 200 MiB, limits trees to 15,000 files, reads at most 128 KiB per source file and 4 MiB of source total, and shows at most 500 file paths in the UI. Import resolution and directory-layer classification are heuristics; resolved imports are evaluated against the architecture rules below. Commit history is limited to the shallow clone and is **not historical drift analysis**. Private repositories, background scan persistence across server restarts, deeper history, and clone progress percentages are not supported in this phase.
 
+For a direct scan of a public GitHub repository without signing in, send `POST /api/scan` with `{"url":"https://github.com/owner/repository"}` and optionally a `"branch"` field. This endpoint downloads the GitHub ZIP archive without cloning or requiring OAuth and returns the repository name, branch, source files, resolved dependencies, layer counts, violations, health score, summary, and any custom-rule configuration error. It returns HTTP 400 for invalid repository URLs and HTTP 404 when GitHub cannot find the repository or branch. It limits repositories and archives to 50 MiB, scans up to 3,000 files (and 10,000 archive entries), limits source files to 2 MiB each, and stops after two minutes. Root-level `driftwatch.yml` and `driftwatch.json` rules in the archive use the same Phase 2 evaluator and format documented below. The local demo can be scanned through this endpoint with `{"demo":true}`; this scans only the bundled `demo-repo/` fixture.
+
 ### Architecture rules and health score
 Each resolved local import is checked against these default layer rules:
 
@@ -74,7 +76,7 @@ JSON uses the same fields in a `rules` array:
 }
 ```
 
-Custom rules accept `frontend`, `backend`, `database`, `service`/`services`, or `shared` for `from` and `to`, and `critical` or `warning` for severity. If a custom configuration is malformed, scanning continues with the defaults and `ruleConfigError` explains why it was ignored. The included `demo-repo/` has two intentional violations and can be scanned locally with `analyzeRepository` from `scanner.js`.
+Custom rules accept `frontend`, `backend`, `database`, `service`/`services`, or `shared` for `from` and `to`, and `critical` or `warning` for severity. If a custom configuration is malformed, scanning continues with the defaults and `ruleConfigError` explains why it was ignored. Both scan paths share layer classification, prioritizing database models/schema, then services/utilities, frontend components/pages, and backend controllers/routes. The included `demo-repo/` has two intentional violations and can be scanned locally with `analyzeRepository` from `scanner.js` or `POST /api/scan` with `{"demo":true}`.
 
 Deploy this as a long-running Node service with Git installed, outbound access to `api.github.com` and `github.com`, a persistent volume for the SQLite database, and the environment variables above. The current static Vercel rewrite alone is not a scan backend: routing the UI to Vercel without deploying/configuring the Node service and its API will not enable scans.
 
