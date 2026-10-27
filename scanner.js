@@ -39,10 +39,10 @@ const MANIFEST_NAMES = new Set([
   'pubspec.yaml', 'Package.swift', 'Dockerfile'
 ]);
 const LAYER_RULES = [
+  ['database', /\b(database|db|data|schema|schemas|migration|migrations|repository|repositories|model|models|prisma)\b/i],
+  ['service', /\b(service|services|domain|worker|workers|job|jobs|function|functions|lib|libs|library|libraries|util|utils|helper|helpers)\b/i],
   ['frontend', /\b(frontend|front-end|client|web|ui|view|views|component|components|pages|app)\b/i],
   ['backend', /\b(backend|back-end|server|api|controller|controllers|handler|handlers|route|routes)\b/i],
-  ['database', /\b(database|db|data|schema|schemas|migration|migrations|repository|repositories|model|models)\b/i],
-  ['service', /\b(service|services|domain|worker|workers|job|jobs|function|functions)\b/i],
   ['shared', /\b(shared|common|lib|libs|library|libraries|util|utils|types|config|configuration)\b/i]
 ];
 const LANGUAGE_BY_MANIFEST = [
@@ -94,10 +94,14 @@ const DEFAULT_RULES = [
 const VALID_LAYERS = new Set(['frontend', 'backend', 'database', 'service', 'services', 'shared']);
 
 function inferLayer(value) {
+  return classifyLayer(value) || 'service';
+}
+
+function classifyLayer(value) {
   for (const [layer, pattern] of LAYER_RULES) {
     if (pattern.test(value)) return layer;
   }
-  return 'service';
+  return null;
 }
 
 function sourceExtension(filePath) {
@@ -319,8 +323,8 @@ function buildDependencies(sourceImports, modules, topLevelFolders, fileSet) {
         to,
         fromFile: filePath,
         toFile: targetPath,
-        fromLayer: normalizeLayer(inferLayer(from === '.' ? 'root' : from)),
-        toLayer: normalizeLayer(inferLayer(to === '.' ? 'root' : to))
+        fromLayer: layerForDependency(filePath, from),
+        toLayer: layerForDependency(targetPath, to)
       });
     }
   }
@@ -329,6 +333,10 @@ function buildDependencies(sourceImports, modules, topLevelFolders, fileSet) {
 
 function normalizeLayer(layer) {
   return layer === 'services' ? 'service' : layer;
+}
+
+function layerForDependency(filePath, moduleName) {
+  return normalizeLayer(classifyLayer(filePath) || inferLayer(moduleName === '.' ? 'root' : moduleName));
 }
 
 function parseYamlRuleConfig(source) {
@@ -564,6 +572,7 @@ async function analyzeRepository(repositoryPath, onProgress = () => {}, signal, 
     manifests,
     modules,
     edges,
+    dependencies,
     ...ruleResults,
     ruleConfigError
   };
@@ -574,7 +583,10 @@ module.exports = {
   analyzeRepository,
   buildEdges,
   buildModules,
+  classifyLayer,
+  evaluateRules,
   inferLayer,
+  loadRules,
   manifestDependencies,
   readRecentCommits,
   walkRepository
