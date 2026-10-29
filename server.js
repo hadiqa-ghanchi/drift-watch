@@ -10,7 +10,12 @@ const express = require('express');
 const session = require('express-session');
 const Database = require('better-sqlite3');
 const { analyzeRepository, readRecentCommits } = require('./scanner');
-const { PublicScanError, scanDemoRepository, scanPublicRepository } = require('./public-scanner');
+const {
+  PublicScanError,
+  scanDemoRepository,
+  scanHistory,
+  scanPublicRepository
+} = require('./public-scanner');
 
 const runFile = promisify(execFile);
 const PORT = Number(process.env.PORT || 3000);
@@ -855,6 +860,32 @@ app.post('/api/scan', async (req, res) => {
     }
     console.error('Public repository scan failed:', error.message);
     res.status(500).json({ error: 'The repository scan failed unexpectedly. Please try again.', code: 'scan_failed' });
+  } finally {
+    activePublicScanCount -= 1;
+  }
+});
+
+app.post('/api/history', async (req, res) => {
+  const origin = req.get('origin');
+  if (origin && origin !== appBase.origin) {
+    res.status(403).json({ error: 'This request could not be verified. Refresh the page and try again.' });
+    return;
+  }
+  if (activePublicScanCount >= MAX_ACTIVE_PUBLIC_SCANS) {
+    res.status(429).json({ error: 'The scan server is busy. Please try again shortly.', code: 'scan_capacity' });
+    return;
+  }
+
+  activePublicScanCount += 1;
+  try {
+    res.json(await scanHistory(req.body || {}));
+  } catch (error) {
+    if (error instanceof PublicScanError) {
+      res.status(error.status).json({ error: error.message, code: error.code });
+      return;
+    }
+    console.error('Repository history scan failed:', error.message);
+    res.status(500).json({ error: 'The repository history scan failed unexpectedly. Please try again.', code: 'history_scan_failed' });
   } finally {
     activePublicScanCount -= 1;
   }

@@ -12,6 +12,7 @@ const MAX_SOURCE_FILE_SIZE = 2 * 1024 * 1024;
 const MAX_FILES = 3000;
 const MAX_ARCHIVE_ENTRIES = 10000;
 const SCAN_TIMEOUT_MS = 120000;
+const HISTORY_TIMEOUT_MS = 10 * 60 * 1000;
 const SOURCE_EXTENSIONS = new Set(['.js', '.jsx', '.ts', '.tsx']);
 const IGNORED_DIRECTORIES = new Set([
   '.git', 'node_modules', 'dist', 'build', '.next',
@@ -158,15 +159,17 @@ function checkDeadline(deadline) {
 async function fetchGitHub(url, signal, notFoundError = {
   code: 'repository_not_found',
   message: 'Repository not found or it is private.'
-}) {
+}, token) {
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': 'Driftwatch-Scanner'
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
   let response;
   try {
     response = await fetch(url, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'Driftwatch-Scanner'
-      },
+      headers,
       signal
     });
   } catch (cause) {
@@ -180,7 +183,11 @@ async function fetchGitHub(url, signal, notFoundError = {
     throw new PublicScanError(404, notFoundError.code, notFoundError.message);
   }
   if (response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0') {
-    throw new PublicScanError(429, 'github_rate_limited', 'GitHub rate limit reached. Please try again later.');
+    throw new PublicScanError(
+      429,
+      'github_rate_limited',
+      'GitHub API rate limit reached. Set GITHUB_TOKEN in .env to raise the limit.'
+    );
   }
   if (!response.ok) {
     throw new PublicScanError(502, 'github_request_failed', 'GitHub could not complete the scan request. Please try again.');
@@ -331,40 +338,49 @@ function extractSourceFiles(archive, destination, deadline) {
   });
 }
 
-async function scanPublicRepository(input) {
-  const { owner, repo } = parseRepositoryUrl(input.url);
-  const requestedBranch = validateBranch(input.branch);
-  const deadline = Date.now() + SCAN_TIMEOUT_MS;
-  const signal = AbortSignal.timeout(SCAN_TIMEOUT_MS);
-  let workspace;
-
+async function getRepositoryMetadata(owner, repo, signal, token) {
+  const metadataResponse = await fetchGitHub(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+    signal,
+    undefined,
+    token
+  );
+  let metadata;
   try {
-    const metadataResponse = await fetchGitHub(
-      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
-      signal
-    );
-    let metadata;
-    try {
-      metadata = await metadataResponse.json();
-    } catch {
-      throw new PublicScanError(502, 'invalid_github_response', 'GitHub returned invalid repository information.');
-    }
-    if (metadata.private) {
-      throw new PublicScanError(403, 'private_repository', 'Private repositories are not supported; use a public GitHub repository.');
-    }
-    if (!Number.isFinite(metadata.size) || typeof metadata.default_branch !== 'string') {
-      throw new PublicScanError(502, 'invalid_github_response', 'GitHub returned invalid repository information.');
-    }
-    if (metadata.size > MAX_REPOSITORY_SIZE_KB) {
-      throw new PublicScanError(413, 'repository_too_large', 'This repository exceeds the 50 MB scan limit.');
-    }
+    metadata = await metadataResponse.json();
+  } catch {
+    throw new PublicScanError(502, 'invalid_github_response', 'GitHub returned invalid repository information.');
+  }
+  if (metadata.private) {
+    throw new PublicScanError(403, 'private_repository', 'Private repositories are not supported; use a public GitHub repository.');
+  }
+  if (!Number.isFinite(metadata.size) || typeof metadata.default_branch !== 'string') {
+    throw new PublicScanError(502, 'invalid_github_response', 'GitHub returned invalid repository information.');
+  }
+  if (metadata.size > MAX_REPOSITORY_SIZE_KB) {
+    throw new PublicScanError(413, 'repository_too_large', 'This repository exceeds the 50 MB scan limit.');
+  }
+  return metadata;
+}
 
-    const branch = requestedBranch || metadata.default_branch;
+async function scanRepositoryAtRef({
+  owner,
+  repo,
+  branch,
+  ref,
+  signal,
+  deadline,
+  token,
+  notFoundError = { code: 'commit_not_found', message: `Commit "${ref}" could not be downloaded.` }
+}) {
+  let workspace;
+  try {
     checkDeadline(deadline);
     const archiveResponse = await fetchGitHub(
-      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/zipball/${encodeURIComponent(branch)}`,
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/zipball/${encodeURIComponent(ref)}`,
       signal,
-      { code: 'branch_not_found', message: `Branch "${branch}" was not found in this repository.` }
+      notFoundError,
+      token
     );
     const archive = await readArchive(archiveResponse, signal);
     workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'driftwatch-public-scan-'));
@@ -415,6 +431,163 @@ async function scanPublicRepository(input) {
   }
 }
 
+async function scanPublicRepository(input) {
+  const { owner, repo } = parseRepositoryUrl(input.url);
+  const requestedBranch = validateBranch(input.branch);
+  const signal = AbortSignal.timeout(SCAN_TIMEOUT_MS);
+  const deadline = Date.now() + SCAN_TIMEOUT_MS;
+  const token = process.env.GITHUB_TOKEN && process.env.GITHUB_TOKEN.trim() || undefined;
+  const metadata = await getRepositoryMetadata(owner, repo, signal, token);
+  const branch = requestedBranch || metadata.default_branch;
+  return scanRepositoryAtRef({
+    owner,
+    repo,
+    branch,
+    ref: branch,
+    signal,
+    deadline,
+    token,
+    notFoundError: { code: 'branch_not_found', message: `Branch "${branch}" was not found in this repository.` }
+  });
+}
+
+function validateHistoryLimit(value) {
+  if (value === undefined) return 12;
+  if (!Number.isInteger(value) || value < 1 || value > 20) {
+    throw new PublicScanError(400, 'invalid_limit', 'History limit must be an integer from 1 to 20.');
+  }
+  return value;
+}
+
+function sampleEvenly(items, limit) {
+  if (items.length <= limit) return [...items];
+  if (limit === 1) return [items[0]];
+  return Array.from({ length: limit }, (_, index) =>
+    items[Math.round(index * (items.length - 1) / (limit - 1))]
+  );
+}
+
+function findFirstDriftCommit(points) {
+  for (let index = 1; index < points.length; index += 1) {
+    if (points[index].healthScore < points[index - 1].healthScore) {
+      return {
+        sha: points[index].sha,
+        message: points[index].message,
+        scoreDrop: points[index - 1].healthScore - points[index].healthScore
+      };
+    }
+  }
+  return null;
+}
+
+function commitDetails(commit) {
+  const message = typeof commit.commit?.message === 'string'
+    ? commit.commit.message.split(/\r?\n/, 1)[0].trim().slice(0, 200)
+    : '';
+  return {
+    sha: commit.sha,
+    message,
+    author: commit.author?.login || commit.commit?.author?.name || commit.commit?.committer?.name || 'Unknown author',
+    date: commit.commit?.author?.date || commit.commit?.committer?.date || null
+  };
+}
+
+async function scanPublicHistory(input, token = process.env.GITHUB_TOKEN && process.env.GITHUB_TOKEN.trim() || undefined) {
+  const { owner, repo } = parseRepositoryUrl(input.url);
+  const requestedBranch = validateBranch(input.branch);
+  const limit = validateHistoryLimit(input.limit);
+  const deadline = Date.now() + HISTORY_TIMEOUT_MS;
+  const signal = AbortSignal.timeout(HISTORY_TIMEOUT_MS);
+  const metadata = await getRepositoryMetadata(owner, repo, signal, token);
+  const branch = requestedBranch || metadata.default_branch;
+  const commits = [];
+
+  for (let page = 1; ; page += 1) {
+    checkDeadline(deadline);
+    const url = new URL(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits`);
+    url.searchParams.set('sha', branch);
+    url.searchParams.set('per_page', '100');
+    url.searchParams.set('page', String(page));
+    const response = await fetchGitHub(
+      url,
+      signal,
+      { code: 'branch_not_found', message: `Branch "${branch}" was not found in this repository.` },
+      token
+    );
+    let pageCommits;
+    try {
+      pageCommits = await response.json();
+    } catch {
+      throw new PublicScanError(502, 'invalid_github_response', 'GitHub returned invalid commit history.');
+    }
+    if (!Array.isArray(pageCommits)) {
+      throw new PublicScanError(502, 'invalid_github_response', 'GitHub returned invalid commit history.');
+    }
+    if (!pageCommits.length && page === 1) {
+      throw new PublicScanError(404, 'repository_not_found', 'No commits were found for this repository and branch.');
+    }
+    commits.push(...pageCommits.map(commitDetails));
+    if (pageCommits.length < 100) break;
+  }
+
+  const selectedCommits = sampleEvenly(commits, limit);
+  const outcomes = [];
+  for (let index = 0; index < selectedCommits.length; index += 3) {
+    const batch = selectedCommits.slice(index, index + 3);
+    const batchOutcomes = await Promise.all(batch.map(async (commit) => {
+      try {
+        if (signal.aborted) throw new PublicScanError(504, 'history_timeout', 'The overall history scan timed out.');
+        const scanSignal = AbortSignal.any([signal, AbortSignal.timeout(SCAN_TIMEOUT_MS)]);
+        const analysis = await scanRepositoryAtRef({
+          owner,
+          repo,
+          branch,
+          ref: commit.sha,
+          signal: scanSignal,
+          deadline: Math.min(deadline, Date.now() + SCAN_TIMEOUT_MS),
+          token
+        });
+        return {
+          ...commit,
+          healthScore: analysis.healthScore,
+          fileCount: analysis.fileCount,
+          critical: analysis.summary.critical,
+          warnings: analysis.summary.warnings
+        };
+      } catch (error) {
+        return {
+          skipped: {
+            sha: commit.sha,
+            message: commit.message,
+            reason: error instanceof PublicScanError
+              ? error.message
+              : 'This commit could not be scanned.'
+          }
+        };
+      }
+    }));
+    outcomes.push(...batchOutcomes);
+  }
+
+  const chronological = outcomes.reverse();
+  const points = chronological.filter((outcome) => !outcome.skipped);
+  const skipped = chronological.flatMap((outcome) => outcome.skipped ? [outcome.skipped] : []);
+  return {
+    repo: `${owner}/${repo}`,
+    branch,
+    points,
+    firstDriftCommit: findFirstDriftCommit(points),
+    skipped
+  };
+}
+
+async function scanHistory(input) {
+  if (input && input.demo === true) {
+    return require('./demo-history.json');
+  }
+  return scanPublicHistory(input || {});
+}
+
 async function scanDemoRepository() {
   const repositoryPath = path.join(__dirname, 'demo-repo');
   const analysis = await analyzeRepository(repositoryPath);
@@ -441,8 +614,11 @@ async function scanDemoRepository() {
 module.exports = {
   PublicScanError,
   importsForFile,
+  findFirstDriftCommit,
   layerForPath,
   parseRepositoryUrl,
+  sampleEvenly,
   scanDemoRepository,
+  scanHistory,
   scanPublicRepository
 };

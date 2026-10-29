@@ -2,9 +2,12 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const {
   importsForFile,
+  findFirstDriftCommit,
   layerForPath,
   parseRepositoryUrl,
+  sampleEvenly,
   scanDemoRepository,
+  scanHistory,
   scanPublicRepository
 } = require('../public-scanner');
 
@@ -94,4 +97,43 @@ test('scans the local demo with the shared Phase 2 rules', async () => {
       { ruleId: 'RULE-004', severity: 'warning' }
     ]
   );
+});
+
+test('samples commit lists evenly and always includes the newest commit', () => {
+  const commits = Array.from({ length: 10 }, (_, index) => ({ sha: `commit-${index}` }));
+  assert.deepEqual(sampleEvenly(commits, 4), [
+    { sha: 'commit-0' },
+    { sha: 'commit-3' },
+    { sha: 'commit-6' },
+    { sha: 'commit-9' }
+  ]);
+  assert.deepEqual(sampleEvenly(commits, 1), [{ sha: 'commit-0' }]);
+});
+
+test('finds the first score drop compared with the previous timeline point', () => {
+  const points = [
+    { sha: 'a', message: 'baseline', healthScore: 100 },
+    { sha: 'b', message: 'no change', healthScore: 100 },
+    { sha: 'c', message: 'first regression', healthScore: 97 },
+    { sha: 'd', message: 'later regression', healthScore: 87 }
+  ];
+  assert.deepEqual(findFirstDriftCommit(points), {
+    sha: 'c',
+    message: 'first regression',
+    scoreDrop: 3
+  });
+  assert.equal(findFirstDriftCommit(points.slice(0, 2)), null);
+});
+
+test('returns the bundled offline demo history', async () => {
+  const history = await scanHistory({ demo: true });
+  assert.equal(history.repo, 'demo-repo');
+  assert.equal(history.points.length, 10);
+  assert.equal(history.points[0].healthScore, 100);
+  assert.equal(history.points.at(-1).healthScore, 87);
+  assert.deepEqual(history.firstDriftCommit, {
+    sha: 'e751461bec42908fd56a0c1745bd92e6f80ac453',
+    message: 'Connect the frontend to user data',
+    scoreDrop: 3
+  });
 });

@@ -81,6 +81,17 @@ test('GitHub OAuth session persists across restarts and rejects invalid requests
   assert.deepEqual(demoScan.summary, { healthy: 4, warnings: 1, critical: 1 });
   assert.deepEqual(demoScan.violations.map(({ ruleId }) => ruleId), ['RULE-001', 'RULE-004']);
 
+  const demoHistoryResponse = await fetch(`${baseUrl}/api/history`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ demo: true })
+  });
+  assert.equal(demoHistoryResponse.status, 200);
+  const demoHistory = await demoHistoryResponse.json();
+  assert.equal(demoHistory.repo, 'demo-repo');
+  assert.equal(demoHistory.points.length, 10);
+  assert.equal(demoHistory.points.at(-1).healthScore, 87);
+
   const invalidPublicScanResponse = await fetch(`${baseUrl}/api/scan`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -143,8 +154,8 @@ test('GitHub sign-in reports when OAuth App credentials are missing', async (t) 
     SESSION_DB_PATH: path.join(temporaryDirectory, 'sessions.sqlite'),
     NODE_ENV: 'test'
   };
-  delete environment.GITHUB_CLIENT_ID;
-  delete environment.GITHUB_CLIENT_SECRET;
+  environment.GITHUB_CLIENT_ID = '';
+  environment.GITHUB_CLIENT_SECRET = '';
   const child = await startServer(environment);
   t.after(async () => {
     await stopServer(child);
